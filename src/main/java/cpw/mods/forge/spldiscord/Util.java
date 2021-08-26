@@ -1,6 +1,7 @@
 package cpw.mods.forge.spldiscord;
 
-import discord4j.core.object.util.Snowflake;
+
+import discord4j.common.util.Snowflake;
 
 public class Util {
     public static Snowflake env(String name) {

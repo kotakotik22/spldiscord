@@ -19,9 +19,6 @@ import java.util.stream.Collectors;
 
 public class CertSigner {
     private static final String SIGNATURE_ALGORITHM = "SHA256withRSA";
-    private static final String CAPATH = Util.defaultEnv("CA_PATH", "/app/volume/cacert.pem");
-    private static final String CAKEY = Util.defaultEnv("CA_KEY","/app/volume/ca.key");
-
 
     public static X509Certificate sign(PKCS10 csr, X509Certificate certificate, PrivateKey signerPrivKey) throws CertificateException, IOException, InvalidKeyException, SignatureException {
 
@@ -101,8 +98,15 @@ public class CertSigner {
     }
 
     static InputStream signCSR(InputStream attachment) {
-        final Path caPath = Paths.get(CAPATH);
-        final Path keyPath = Paths.get(CAKEY);
+        Bot.Config config = null;
+        try {
+            config = Bot.IConfig.fromJsonFile();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        assert config != null;
+        final Path caPath = Paths.get(config.getCaPath());
+        final Path keyPath = Paths.get(config.getCaKey());
         CertificateManager.loadCertificates(caPath, certs -> caCert = certs);
         CertificateManager.loadKey(keyPath, keyPair -> key = keyPair);
         String derString;

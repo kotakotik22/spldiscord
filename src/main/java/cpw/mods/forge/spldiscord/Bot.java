@@ -1,17 +1,22 @@
 package cpw.mods.forge.spldiscord;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import discord4j.common.util.Snowflake;
 import discord4j.core.DiscordClient;
 import discord4j.core.DiscordClientBuilder;
-import discord4j.core.event.EventDispatcher;
+import discord4j.core.GatewayDiscordClient;
 import discord4j.core.event.domain.lifecycle.ReadyEvent;
 import discord4j.core.event.domain.message.ReactionAddEvent;
-import discord4j.core.object.entity.*;
-import discord4j.core.object.presence.Activity;
-import discord4j.core.object.presence.Presence;
+import discord4j.core.object.entity.Attachment;
+import discord4j.core.object.entity.Member;
+import discord4j.core.object.entity.Message;
+import discord4j.core.object.entity.User;
+import discord4j.core.object.entity.channel.TextChannel;
 import discord4j.core.object.reaction.ReactionEmoji;
-import discord4j.core.object.util.Snowflake;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
@@ -21,8 +26,8 @@ import reactor.netty.ByteBufMono;
 import reactor.netty.http.client.HttpClient;
 import reactor.netty.http.client.HttpClientResponse;
 import reactor.util.function.Tuple3;
-import sun.rmi.runtime.Log;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -35,61 +40,180 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class Bot {
-    private static final Snowflake REQUESTCHANNEL = Util.env("REQUEST_CHANNEL");
-    private static final Snowflake MODUPDATECHANNEL = Util.env("MODS_CHANNEL");
-    private static final Snowflake GUILD = Util.env("GUILD");
-    private static final Snowflake APPROVERROLE = Util.env("APPROVER_ROLE");
+    public static class Config implements IConfig {
+        public Config(String requestChannel, String updateChannel, String guild, String approverRole, String modDir, String token, String caPath, String caKey) {
+            this.requestChannel = requestChannel;
+            this.updateChannel = updateChannel;
+            this.guild = guild;
+            this.approverRole = approverRole;
+            this.modDir = modDir;
+            this.token = token;
+            this.caPath = caPath;
+            this.caKey = caKey;
+        }
+
+        public Config(Snowflake requestChannel, Snowflake updateChannel, Snowflake guild, Snowflake approverRole, String modDir, String token, String caPath, String caKey) {
+            this(requestChannel.asString(), updateChannel.asString(), guild.asString(), approverRole.asString(), modDir, token, caPath, caKey);
+        }
+
+        protected String updateChannel = "?", guild = "?", approverRole = "?", requestChannel = "?", modDir = "?", token = "?", caPath = "?", caKey = "?";
+
+        @Override
+        public String getCaKey() {
+            return caKey;
+        }
+
+        @Override
+        public String getCaPath() {
+            return caPath;
+        }
+
+        protected static Snowflake s(String str) {
+            return Snowflake.of(str);
+        }
+
+        @Override
+        public Snowflake getRequestChannel() {
+            return s(requestChannel);
+        }
+
+        @Override
+        public Snowflake getUpdateChannel() {
+            return s(updateChannel);
+        }
+
+        @Override
+        public Snowflake getGuild() {
+            return s(guild);
+        }
+
+        @Override
+        public Snowflake getApproverRole() {
+            return s(approverRole);
+        }
+
+        @Override
+        public Path getModDir() {
+            return Paths.get(modDir);
+        }
+
+        @Override
+        public String getToken() {
+            return token;
+        }
+
+        public String toJson() {
+            return new GsonBuilder().setPrettyPrinting().create().toJson(this);
+        }
+    }
+
+    public interface IConfig {
+        Snowflake getRequestChannel();
+        Snowflake getUpdateChannel();
+        Snowflake getGuild();
+        Snowflake getApproverRole();
+        Path getModDir();
+        String getToken();
+        String getCaPath();
+        String getCaKey();
+
+        default List<Snowflake> getMonitoredChannels() {
+            return Arrays.asList(getRequestChannel(), getUpdateChannel());
+        }
+
+        static Config fromEnv() {
+            return new Config(
+                    Util.env("REQUEST_CHANNEL"),
+                    Util.env("MODS_CHANNEL"),
+                    Util.env("GUILD"),
+                    Util.env("APPROVER_ROLE"),
+                    Util.defaultEnv("OUTPUT_DIR", "."),
+                    Util.defaultEnv("BOT_TOKEN", "0"),
+                    Util.defaultEnv("CA_PATH", "/app/volume/cacert.pem"),
+                    Util.defaultEnv("CA_KEY","/app/volume/ca.key")
+            );
+        }
+
+        static Config fromJson(String json) {
+            return new Gson().fromJson(json, Config.class);
+        }
+
+        static Config fromJsonFile(String path) {
+            File file = new File(path);
+            Config c = null;
+            if(file.exists()) {
+                try {
+                    c = fromJson(FileUtils.readFileToString(file, (String) null));
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            } else {
+                c = fromEnv();
+            }
+            try {
+                FileUtils.writeStringToFile(file, c.toJson(), (String) null);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            return c;
+        }
+
+        static Config fromJsonFile() throws IOException {
+            File f = new File("splconfigpath.txt");
+            if(!f.exists()) {
+                FileUtils.writeStringToFile(f, "spl.json", (String) null);
+            }
+            return fromJsonFile(FileUtils.readFileToString(f, (String) null));
+        }
+    }
+
+//    private static final Snowflake REQUESTCHANNEL = Util.env("REQUEST_CHANNEL");
+//    private static final Snowflake MODUPDATECHANNEL = Util.env("MODS_CHANNEL");
+//    private static final Snowflake GUILD = Util.env("GUILD");
+//    private static final Snowflake APPROVERROLE = Util.env("APPROVER_ROLE");
     private static final ReactionEmoji.Unicode THUMBSUP = ReactionEmoji.unicode("\ud83d\udc4d");
     private static final ReactionEmoji.Unicode UNAMUSED = ReactionEmoji.unicode("\ud83d\ude12");
     private static final ReactionEmoji.Unicode TICK = ReactionEmoji.unicode("\u2714");
     private static final ReactionEmoji.Unicode CROSS = ReactionEmoji.unicode("\u274C");
-    private static final Path MODDIR = Paths.get(Util.defaultEnv("OUTPUT_DIR", "."));
-    private Snowflake me;
-    private static final List<Snowflake> MONITORED_CHANNELS = Arrays.asList(REQUESTCHANNEL, MODUPDATECHANNEL);
+//    private static final Path MODDIR = Paths.get(Util.defaultEnv("OUTPUT_DIR", "."));
     private final Map<Snowflake, Function<Flux<ReactionAddEvent>, Publisher<Void>>> messageHandlerByChannel;
+    private Snowflake me;
 
-    public static void main(String[] args) {
+    protected IConfig config;
+
+    public static void main(String[] args) throws IOException {
         LogManager.getLogger().info("HELLO");
-        new Bot(Util.defaultEnv("BOT_TOKEN", "0"));
+        new Bot(IConfig.fromJsonFile());
     }
 
-    private Bot(final String token) {
+    public Bot(IConfig config) {
+        this.config = config;
+
         messageHandlerByChannel = new HashMap<>();
-        messageHandlerByChannel.put(REQUESTCHANNEL, this::handleAuthChannel);
-        messageHandlerByChannel.put(MODUPDATECHANNEL, this::handleModChannel);
+        messageHandlerByChannel.put(config.getRequestChannel(), this::handleAuthChannel);
+        messageHandlerByChannel.put(config.getUpdateChannel(), this::handleModChannel);
 
-        DiscordClient client = new DiscordClientBuilder(token).build();
-        EventDispatcher eventDispatcher = client.getEventDispatcher();
+        DiscordClient client = DiscordClientBuilder.create(config.getToken()).build();
+        GatewayDiscordClient eventDispatcher = client.login().block();
 
-        Mono<Void> setup = eventDispatcher.on(ReadyEvent.class).flatMap(this::setup).then();
+        eventDispatcher.on(ReadyEvent.class).subscribe((e) -> {
+            me = e.getSelf().getId();
+        });
         Mono<Void> catchup = eventDispatcher.on(ReadyEvent.class).flatMap(this::catchupMessages).then();
         Mono<Void> reaction = eventDispatcher.on(ReactionAddEvent.class)
                 .transform(this::filterReactionEvents)
                 .groupBy(ReactionAddEvent::getChannelId)
                 .transform(this::dispatchReactionEventToHandler)
                 .then();
-        Mono<Void> login = client.login();
-        Mono<Snowflake> me = client.getSelf().map(User::getId).map(id -> this.me = id);
-        Runtime.getRuntime().addShutdownHook(new Thread(()->client.logout().block()));
-        Mono.when(setup, catchup, reaction, me, login).doOnError(this::error).block();
-    }
-
-    private Mono<Void> setup(final ReadyEvent event) {
-        return Flux.fromIterable(MONITORED_CHANNELS)
-                .flatMap(event.getClient()::getChannelById)
-                .ofType(TextChannel.class)
-                .map(GuildChannel::getName)
-                .collect(Collectors.joining(", "))
-                .flatMap(name -> event.getClient()
-                        .updatePresence(Presence.online(Activity.watching(name)))
-                );
+        Runtime.getRuntime().addShutdownHook(new Thread(()->eventDispatcher.onDisconnect().block()));
+        Mono.when(catchup, reaction).doOnError(this::error).block();
     }
 
     private Mono<Void> catchupMessages(final ReadyEvent evt) {
         Snowflake now = Snowflake.of(Instant.now());
         return evt.getClient()
-                .getGuildById(GUILD)
-                .flatMap(g -> g.getChannelById(REQUESTCHANNEL).ofType(TextChannel.class))
+                .getGuildById(config.getGuild())
+                .flatMap(g -> g.getChannelById(config.getRequestChannel()).ofType(TextChannel.class))
                 .flatMapMany(tc -> tc.getMessagesBefore(now))
                 .transform(this::authChannelFilter)
                 .flatMap(this::handleValidAuthMessage)
@@ -99,7 +223,7 @@ public class Bot {
     private Flux<ReactionAddEvent> filterReactionEvents(final Flux<ReactionAddEvent> reactions) {
         return reactions
                 .filter(event -> Objects.equals(THUMBSUP, event.getEmoji()))
-                .filter(event -> MONITORED_CHANNELS.contains(event.getChannelId()));
+                .filter(event -> config.getMonitoredChannels().contains(event.getChannelId()));
     }
 
     private Flux<Void> dispatchReactionEventToHandler(Flux<GroupedFlux<Snowflake, ReactionAddEvent>> flux) {
@@ -141,8 +265,8 @@ public class Bot {
         return messages
                 .filterWhen(m -> m
                         .getReactors(THUMBSUP)
-                        .flatMap(r -> r.asMember(GUILD))
-                        .any(mem -> mem.getRoleIds().contains(APPROVERROLE)))
+                        .flatMap(r -> r.asMember(config.getGuild()))
+                        .any(mem -> mem.getRoleIds().contains(config.getApproverRole())))
                 .filterWhen(m -> m
                         .getReactors(TICK)
                         .map(User::getId)
@@ -175,6 +299,7 @@ public class Bot {
     private Mono<Void> handleValidModMessage(final Message message) {
         Mono<Void> ok = message.addReaction(TICK);
         Mono<Void> files;
+        Optional<String> content = Optional.of(message.getContent()); // yeah i know i can just use the string but this makes porting easier
         if (message.getAttachments().stream().anyMatch(att->att.getFilename().endsWith(".jar"))) {
             files = Flux.from(message
                     .getAttachments()
@@ -192,20 +317,20 @@ public class Bot {
                                     inputStream -> saveFile(inputStream, getFilenameFromUrlString(url))))
                             .orElse(Mono.empty()))
                     .then(ok);
-        } else if (message.getContent().map(s->s.startsWith("http") && s.endsWith(".jar")).orElse(Boolean.FALSE)) {
-            LogManager.getLogger().info("Downloading from message URL: {}", message.getContent().get());
-            files = Flux.from(message.getContent()
+        } else if (content.map(s->s.startsWith("http") && s.endsWith(".jar")).orElse(Boolean.FALSE)) {
+            LogManager.getLogger().info("Downloading from message URL: {}", content.get());
+            files = Flux.from(content
                     .map(url -> downloadUrl(url,
                             inputStream -> saveFile(inputStream, getFilenameFromUrlString(url)))).orElse(Mono.empty()))
                     .then(ok);
-        } else if (message.getContent().map(s->s.startsWith("https://www.curseforge.com/minecraft/")).orElse(Boolean.FALSE)) {
-            LogManager.getLogger().info("Downloading from CURSE URL: {}", message.getContent().get());
-            files = downloadUrl("https://addons-ecs.forgesvc.net/api/v2/addon/0/file/"+ getFilenameFromUrlString(message.getContent().get())+"/download-url", this::getInputStreamAsString)
+        } else if (content.map(s->s.startsWith("https://www.curseforge.com/minecraft/")).orElse(Boolean.FALSE)) {
+            LogManager.getLogger().info("Downloading from CURSE URL: {}", content.get());
+            files = downloadUrl("https://addons-ecs.forgesvc.net/api/v2/addon/0/file/"+ getFilenameFromUrlString(content.get())+"/download-url", this::getInputStreamAsString)
                     .flatMap(actual->downloadUrl(actual,
                             is-> saveFile(is, getFilenameFromUrlString(actual))))
                     .then(ok);
         } else {
-            LogManager.getLogger().info("Unable to understand message: {}", message.getContent().orElse("NO CONTENT FOUND"));
+            LogManager.getLogger().info("Unable to understand message: {}", content.orElse("NO CONTENT FOUND"));
             files = message.addReaction(UNAMUSED);
         }
         return files.onErrorResume(throwable -> reactionError(throwable, message));
@@ -228,7 +353,7 @@ public class Bot {
     private String saveFile(final InputStream inputStream, final String filename) {
         try {
             LogManager.getLogger().info("Downloading file to {}", filename);
-            Files.copy(inputStream, MODDIR.resolve(filename));
+            Files.copy(inputStream, config.getModDir().resolve(filename));
             LogManager.getLogger().info("File download to {} complete", filename);
         } catch (IOException e) {
             throw new UncheckedIOException(e);

@@ -1,5 +1,5 @@
 # ServerPackLocator companion discord bot
 
-This allows for simple management of the generation of certificates for signing requests.
+Fork of [cpw/spldiscordbot](https://github.com/cpw/spldiscordbot), with file driven configs instead of environment variable ones
 
-It is designed to run in a docker container.
+Created for the Create Modders server
