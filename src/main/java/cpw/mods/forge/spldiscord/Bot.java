@@ -13,13 +13,14 @@ import discord4j.core.object.entity.Member;
 import discord4j.core.object.entity.Message;
 import discord4j.core.object.entity.User;
 import discord4j.core.object.entity.channel.TextChannel;
-import discord4j.core.object.reaction.Reaction;
 import discord4j.core.object.reaction.ReactionEmoji;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
+import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.GroupedFlux;
 import reactor.core.publisher.Mono;
 import reactor.netty.ByteBufMono;
 import reactor.netty.http.client.HttpClient;
@@ -35,13 +36,14 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.*;
-import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 public class Bot {
     public static class Config implements IConfig {
-        public Config(String requestChannel, String guild, String approverRole, String modDir, String token, String caPath, String caKey) {
+        public Config(String requestChannel, String updateChannel, String guild, String approverRole, String modDir, String token, String caPath, String caKey) {
             this.requestChannel = requestChannel;
+            this.updateChannel = updateChannel;
             this.guild = guild;
             this.approverRole = approverRole;
             this.modDir = modDir;
@@ -50,11 +52,11 @@ public class Bot {
             this.caKey = caKey;
         }
 
-        public Config(Snowflake requestChannel, Snowflake guild, Snowflake approverRole, String modDir, String token, String caPath, String caKey) {
-            this(requestChannel.asString(), guild.asString(), approverRole.asString(), modDir, token, caPath, caKey);
+        public Config(Snowflake requestChannel, Snowflake updateChannel, Snowflake guild, Snowflake approverRole, String modDir, String token, String caPath, String caKey) {
+            this(requestChannel.asString(), updateChannel.asString(), guild.asString(), approverRole.asString(), modDir, token, caPath, caKey);
         }
 
-        protected String guild = "?", approverRole = "?", requestChannel = "?", modDir = "?", token = "?", caPath = "?", caKey = "?";
+        protected String updateChannel = "?", guild = "?", approverRole = "?", requestChannel = "?", modDir = "?", token = "?", caPath = "?", caKey = "?";
 
         @Override
         public String getCaKey() {
@@ -73,6 +75,11 @@ public class Bot {
         @Override
         public Snowflake getRequestChannel() {
             return s(requestChannel);
+        }
+
+        @Override
+        public Snowflake getUpdateChannel() {
+            return s(updateChannel);
         }
 
         @Override
@@ -102,6 +109,7 @@ public class Bot {
 
     public interface IConfig {
         Snowflake getRequestChannel();
+        Snowflake getUpdateChannel();
         Snowflake getGuild();
         Snowflake getApproverRole();
         Path getModDir();
@@ -110,12 +118,13 @@ public class Bot {
         String getCaKey();
 
         default List<Snowflake> getMonitoredChannels() {
-            return Collections.singletonList(getRequestChannel());
+            return Arrays.asList(getRequestChannel(), getUpdateChannel());
         }
 
         static Config fromEnv() {
             return new Config(
                     Util.env("REQUEST_CHANNEL"),
+                    Util.env("MODS_CHANNEL"),
                     Util.env("GUILD"),
                     Util.env("APPROVER_ROLE"),
                     Util.defaultEnv("OUTPUT_DIR", "."),
@@ -167,7 +176,7 @@ public class Bot {
     private static final ReactionEmoji.Unicode TICK = ReactionEmoji.unicode("\u2714");
     private static final ReactionEmoji.Unicode CROSS = ReactionEmoji.unicode("\u274C");
 //    private static final Path MODDIR = Paths.get(Util.defaultEnv("OUTPUT_DIR", "."));
-    private final Map<Snowflake, Consumer<ReactionAddEvent>> messageHandlerByChannel;
+    private final Map<Snowflake, Function<Flux<ReactionAddEvent>, Publisher<Void>>> messageHandlerByChannel;
     private Snowflake me;
 
     protected IConfig config;
@@ -182,6 +191,7 @@ public class Bot {
 
         messageHandlerByChannel = new HashMap<>();
         messageHandlerByChannel.put(config.getRequestChannel(), this::handleAuthChannel);
+        messageHandlerByChannel.put(config.getUpdateChannel(), this::handleModChannel);
 
         DiscordClient client = DiscordClientBuilder.create(config.getToken()).build();
         GatewayDiscordClient eventDispatcher = client.login().block();
@@ -189,106 +199,92 @@ public class Bot {
         eventDispatcher.on(ReadyEvent.class).subscribe((e) -> {
             me = e.getSelf().getId();
         });
-        eventDispatcher.on(ReadyEvent.class).subscribe(this::catchupMessages);
-        eventDispatcher.on(ReactionAddEvent.class).subscribe(this::filterReactionEvents);
-//                .transform(this::filterReactionEvents)
-//                .groupBy(ReactionAddEvent::getChannelId)
-//                .transform(this::dispatchReactionEventToHandler)
-//                .then();
+        Mono<Void> catchup = eventDispatcher.on(ReadyEvent.class).flatMap(this::catchupMessages).then();
+        Mono<Void> reaction = eventDispatcher.on(ReactionAddEvent.class)
+                .transform(this::filterReactionEvents)
+                .groupBy(ReactionAddEvent::getChannelId)
+                .transform(this::dispatchReactionEventToHandler)
+                .then();
         Runtime.getRuntime().addShutdownHook(new Thread(()->eventDispatcher.onDisconnect().block()));
+        Mono.when(catchup, reaction).doOnError(this::error).block();
     }
 
-    private void catchupMessages(final ReadyEvent e) {
+    private Mono<Void> catchupMessages(final ReadyEvent evt) {
         Snowflake now = Snowflake.of(Instant.now());
-        e.getClient()
+        return evt.getClient()
                 .getGuildById(config.getGuild())
                 .flatMap(g -> g.getChannelById(config.getRequestChannel()).ofType(TextChannel.class))
                 .flatMapMany(tc -> tc.getMessagesBefore(now))
-                .filter(this::authChannelFilter)
-                .toStream().forEach(this::handleValidAuthMessage);
+                .transform(this::authChannelFilter)
+                .flatMap(this::handleValidAuthMessage)
+                .then();
     }
 
-    private void filterReactionEvents(final ReactionAddEvent event) {
-        if(Objects.equals(event.getEmoji(), THUMBSUP) && config.getMonitoredChannels().contains(event.getChannelId())) {
-            dispatchReactionEventToHandler(event);
-        }
-//                .filter(event -> Objects.equals(THUMBSUP, event.getEmoji()))
-//                .filter(event -> config.getMonitoredChannels().contains(event.getChannelId()));
+    private Flux<ReactionAddEvent> filterReactionEvents(final Flux<ReactionAddEvent> reactions) {
+        return reactions
+                .filter(event -> Objects.equals(THUMBSUP, event.getEmoji()))
+                .filter(event -> config.getMonitoredChannels().contains(event.getChannelId()));
     }
 
-    private void dispatchReactionEventToHandler(ReactionAddEvent ev) {
-        messageHandlerByChannel.get(ev.getChannelId()).accept(ev);
+    private Flux<Void> dispatchReactionEventToHandler(Flux<GroupedFlux<Snowflake, ReactionAddEvent>> flux) {
+        return flux.flatMap(gf -> gf.transform(messageHandlerByChannel.get(gf.key())));
     }
 
     private void error(final Throwable throwable) {
         LogManager.getLogger().throwing(throwable);
     }
 
-    private void handleAuthChannel(final ReactionAddEvent e) {
-        Message msg = e.getMessage().block();
-        if(authChannelFilter(msg)) {
-            handleValidAuthMessage(msg);
-        }
-//        return reactionEvent
-//                .flatMap(ReactionAddEvent::getMessage)
-//                .transform(this::authChannelFilter)
-//                .flatMap(this::handleValidAuthMessage)
-//                .then();
+    private Publisher<Void> handleAuthChannel(final Flux<ReactionAddEvent> reactionEvent) {
+        return reactionEvent
+                .flatMap(ReactionAddEvent::getMessage)
+                .transform(this::authChannelFilter)
+                .flatMap(this::handleValidAuthMessage)
+                .then();
     }
 
-    private boolean authChannelFilter(Message msg) {
-        if(!msg.getAttachments().isEmpty() && msg.getAttachments().stream().anyMatch(a -> a.getFilename().endsWith(".csr"))) {
-            return filterMessageReactions(msg);
-        }
-        return false;
+    private Publisher<Void> handleModChannel(final Flux<ReactionAddEvent> reactionEvent) {
+        return reactionEvent
+                .flatMap(ReactionAddEvent::getMessage)
+                .transform(this::modChannelFilter)
+                .flatMap(this::handleValidModMessage)
+                .then();
     }
 
-    private boolean runIfHasReaction(Message msg, ReactionEmoji.Unicode emoji, Consumer<Reaction> cons) {
-        return msg.getReactions().stream().anyMatch(r -> {
-            if(r.getEmoji().asUnicodeEmoji().get().equals(emoji)) {
-                cons.accept(r);
-                return true;
-            }
-            return false;
-        });
+    private Flux<Message> authChannelFilter(Flux<Message> messages) {
+        return messages
+                .filter(mess -> !mess.getAttachments().isEmpty())
+                .filter(mess -> mess.getAttachments().stream().anyMatch(attachment -> attachment.getFilename().endsWith(".csr")))
+                .transform(this::filterMessageReactions);
     }
 
-    private boolean hasReaction(Message msg, ReactionEmoji.Unicode emoji) {
-        return runIfHasReaction(msg, emoji, r -> {});
+    private Flux<Message> modChannelFilter(Flux<Message> messages) {
+        return messages.transform(this::filterMessageReactions);
     }
 
-    private boolean meReactedWith(Message msg, ReactionEmoji.Unicode emoji) {
-        return msg.getReactors(emoji).map(User::getId).any(s -> me.equals(s)).block();
+    private Flux<Message> filterMessageReactions(Flux<Message> messages) {
+        return messages
+                .filterWhen(m -> m
+                        .getReactors(THUMBSUP)
+                        .flatMap(r -> r.asMember(config.getGuild()))
+                        .any(mem -> mem.getRoleIds().contains(config.getApproverRole())))
+                .filterWhen(m -> m
+                        .getReactors(TICK)
+                        .map(User::getId)
+                        .collect(Collectors.toSet())
+                        .map(set -> !set.contains(me)))
+                .filterWhen(m -> m
+                        .getReactors(CROSS)
+                        .map(User::getId)
+                        .collect(Collectors.toSet())
+                        .map(set -> !set.contains(me)))
+                .filterWhen(m -> m
+                        .getReactors(UNAMUSED)
+                        .map(User::getId)
+                        .collect(Collectors.toSet())
+                        .map(set -> !set.contains(me)));
     }
 
-    private boolean filterMessageReactions(Message msg) {
-        return (hasReaction(msg, THUMBSUP) && msg.getAuthorAsMember().block().getRoleIds().contains(config.getApproverRole()))
-                || (hasReaction(msg, TICK) && !meReactedWith(msg, TICK))
-                || (hasReaction(msg, CROSS) && !meReactedWith(msg, CROSS))
-                || (hasReaction(msg, UNAMUSED) && !meReactedWith(msg, UNAMUSED));
-//        return messages
-//                .filterWhen(m -> m
-//                        .getReactors(THUMBSUP)
-//                        .flatMap(r -> r.asMember(config.getGuild()))
-//                        .any(mem -> mem.getRoleIds().contains(config.getApproverRole())))
-//                .filterWhen(m -> m
-//                        .getReactors(TICK)
-//                        .map(User::getId)
-//                        .collect(Collectors.toSet())
-//                        .map(set -> !set.contains(me)))
-//                .filterWhen(m -> m
-//                        .getReactors(CROSS)
-//                        .map(User::getId)
-//                        .collect(Collectors.toSet())
-//                        .map(set -> !set.contains(me)))
-//                .filterWhen(m -> m
-//                        .getReactors(UNAMUSED)
-//                        .map(User::getId)
-//                        .collect(Collectors.toSet())
-//                        .map(set -> !set.contains(me)));
-    }
-
-    private void handleValidAuthMessage(Message msg) {
+    private Mono<Void> handleValidAuthMessage(Message msg) {
         Mono<InputStream> cert = msg.getAttachments()
                 .stream()
                 .findFirst()
@@ -297,7 +293,7 @@ public class Bot {
         Mono<TextChannel> channel = msg.getChannel().ofType(TextChannel.class);
         Mono<Message> message = Mono.zip(cert, userName, channel).flatMap(this::buildCertificateAttachment);
         Mono<Void> ok = msg.addReaction(TICK);
-        message.then(ok).onErrorResume(t->this.reactionError(t, msg));
+        return message.then(ok).onErrorResume(t->this.reactionError(t, msg));
     }
 
     private Mono<Void> handleValidModMessage(final Message message) {
