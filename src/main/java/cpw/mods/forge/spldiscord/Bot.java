@@ -41,9 +41,8 @@ import java.util.stream.Collectors;
 
 public class Bot {
     public static class Config implements IConfig {
-        public Config(String requestChannel, String updateChannel, String guild, String approverRole, String modDir, String token, String caPath, String caKey) {
+        public Config(String requestChannel, String guild, String approverRole, String modDir, String token, String caPath, String caKey) {
             this.requestChannel = requestChannel;
-            this.updateChannel = updateChannel;
             this.guild = guild;
             this.approverRole = approverRole;
             this.modDir = modDir;
@@ -52,11 +51,11 @@ public class Bot {
             this.caKey = caKey;
         }
 
-        public Config(Snowflake requestChannel, Snowflake updateChannel, Snowflake guild, Snowflake approverRole, String modDir, String token, String caPath, String caKey) {
-            this(requestChannel.asString(), updateChannel.asString(), guild.asString(), approverRole.asString(), modDir, token, caPath, caKey);
+        public Config(Snowflake requestChannel, Snowflake guild, Snowflake approverRole, String modDir, String token, String caPath, String caKey) {
+            this(requestChannel.asString(), guild.asString(), approverRole.asString(), modDir, token, caPath, caKey);
         }
 
-        protected String updateChannel = "?", guild = "?", approverRole = "?", requestChannel = "?", modDir = "?", token = "?", caPath = "?", caKey = "?";
+        protected String guild = "?", approverRole = "?", requestChannel = "?", modDir = "?", token = "?", caPath = "?", caKey = "?";
 
         @Override
         public String getCaKey() {
@@ -75,11 +74,6 @@ public class Bot {
         @Override
         public Snowflake getRequestChannel() {
             return s(requestChannel);
-        }
-
-        @Override
-        public Snowflake getUpdateChannel() {
-            return s(updateChannel);
         }
 
         @Override
@@ -109,7 +103,6 @@ public class Bot {
 
     public interface IConfig {
         Snowflake getRequestChannel();
-        Snowflake getUpdateChannel();
         Snowflake getGuild();
         Snowflake getApproverRole();
         Path getModDir();
@@ -118,13 +111,12 @@ public class Bot {
         String getCaKey();
 
         default List<Snowflake> getMonitoredChannels() {
-            return Arrays.asList(getRequestChannel(), getUpdateChannel());
+            return Arrays.asList(getRequestChannel());
         }
 
         static Config fromEnv() {
             return new Config(
                     Util.env("REQUEST_CHANNEL"),
-                    Util.env("MODS_CHANNEL"),
                     Util.env("GUILD"),
                     Util.env("APPROVER_ROLE"),
                     Util.defaultEnv("OUTPUT_DIR", "."),
@@ -191,7 +183,6 @@ public class Bot {
 
         messageHandlerByChannel = new HashMap<>();
         messageHandlerByChannel.put(config.getRequestChannel(), this::handleAuthChannel);
-        messageHandlerByChannel.put(config.getUpdateChannel(), this::handleModChannel);
 
         DiscordClient client = DiscordClientBuilder.create(config.getToken()).build();
         GatewayDiscordClient eventDispatcher = client.login().block();
@@ -242,23 +233,11 @@ public class Bot {
                 .then();
     }
 
-    private Publisher<Void> handleModChannel(final Flux<ReactionAddEvent> reactionEvent) {
-        return reactionEvent
-                .flatMap(ReactionAddEvent::getMessage)
-                .transform(this::modChannelFilter)
-                .flatMap(this::handleValidModMessage)
-                .then();
-    }
-
     private Flux<Message> authChannelFilter(Flux<Message> messages) {
         return messages
                 .filter(mess -> !mess.getAttachments().isEmpty())
                 .filter(mess -> mess.getAttachments().stream().anyMatch(attachment -> attachment.getFilename().endsWith(".csr")))
                 .transform(this::filterMessageReactions);
-    }
-
-    private Flux<Message> modChannelFilter(Flux<Message> messages) {
-        return messages.transform(this::filterMessageReactions);
     }
 
     private Flux<Message> filterMessageReactions(Flux<Message> messages) {
